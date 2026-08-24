@@ -1,0 +1,299 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# MVP — Previsão do Valor FIPE de Veículos\n### Sistemas de Suporte à Decisão\n\n---\n\n## 0. Definição do Problema\n\n**Contexto de negócio.** Um gestor de frota / comprador precisa estimar o valor de mercado\n(referência FIPE) de um veículo a partir de seus atributos cadastrais, sem depender de\nconsulta manual à tabela FIPE veículo a veículo. O objetivo do sistema de suporte à decisão\né responder: *\"quanto vale este veículo?\"* e *\"esta oferta está acima ou abaixo do valor justo?\"*\n\n| Item | Definição |\n|---|---|\n| **Tipo de problema** | Aprendizado supervisionado — **Regressão** |\n| **Variável alvo (y)** | `Valor FIPE` (R$) |\n| **Atributos (X)** | Montadora, Modelo, Cor, Grupo, Situação, Ano Modelo (+ derivadas) |\n| **Métrica primária** | **MAE** (erro médio em R$ — interpretável pelo gestor) |\n| **Métricas secundárias** | RMSE (pune erros grandes), R², MAPE (erro relativo) |\n| **Unidade de análise** | 1 registro = 1 veículo da frota |\n\n### Premissas\n1. O `Valor FIPE` do dataset foi capturado em uma mesma janela temporal — não há efeito de\n   inflação/atualização mensal entre registros.\n2. A tabela FIPE é, por construção, uma função quase determinística de\n   *(marca, modelo/versão, ano-modelo)*. Cor, grupo e situação **não** entram no cálculo oficial\n   da FIPE — servem aqui apenas como proxies de segmento/porte.\n3. Registros com valor ausente, zerado ou absurdo são erro de cadastro, não realidade de mercado.\n\n### Restrições de seleção dos dados\n- Apenas registros com `Valor FIPE` preenchido e `> 0`.\n- Apenas veículos com `Ano Modelo` plausível (1985 até ano corrente + 1).\n- Categorias raríssimas (frequência < 2) são agrupadas em `OUTROS` para não gerar colunas\n  one-hot que só existem no treino.\n\n### ⚠️ Ponto crítico deste MVP: vazamento por veículos duplicados\nUma frota contém **muitos veículos idênticos** (mesma montadora, modelo e ano) e, portanto,\ncom **exatamente o mesmo Valor FIPE**. Um `train_test_split` aleatório coloca cópias do mesmo\nveículo nos dois lados da divisão — o modelo \"acerta\" porque **já viu a resposta**, não porque\ngeneralizou. Isso infla o R² artificialmente e explica resultados contraintuitivos\n(ex.: regressão linear superando XGBoost).\n\n> **Solução adotada:** validação com **`GroupKFold` agrupado por *(Montadora, Modelo, Ano Modelo)***,\n> garantindo que um mesmo veículo nunca esteja em treino e teste ao mesmo tempo.\n> O notebook mede e **compara os dois cenários** para deixar o efeito explícito.\n\n---"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Setup e carga dos dados"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Instala apenas o que falta no Colab\n!pip install -q xgboost openpyxl 2>/dev/null\n\nimport warnings, re, unicodedata, datetime as dt\nwarnings.filterwarnings(\"ignore\")\n\nimport numpy as np\nimport pandas as pd\nimport matplotlib.pyplot as plt\nimport seaborn as sns\n\nfrom sklearn.model_selection import GroupShuffleSplit, GroupKFold, KFold, cross_val_predict\nfrom sklearn.compose import ColumnTransformer\nfrom sklearn.pipeline import Pipeline\nfrom sklearn.preprocessing import OneHotEncoder, StandardScaler\nfrom sklearn.impute import SimpleImputer\nfrom sklearn.linear_model import Ridge\nfrom sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor\nfrom sklearn.dummy import DummyRegressor\nfrom sklearn.inspection import permutation_importance\nfrom sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score\n\nRANDOM_STATE = 42\nnp.random.seed(RANDOM_STATE)\n\nsns.set_theme(style=\"whitegrid\")\nplt.rcParams[\"figure.figsize\"] = (10, 5)\npd.set_option(\"display.float_format\", lambda v: f\"{v:,.2f}\")\n\ntry:\n    from xgboost import XGBRegressor\n    HAS_XGB = True\nexcept Exception:\n    HAS_XGB = False\nprint(\"Setup concluído. XGBoost disponível:\", HAS_XGB)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# ---- Carga do arquivo -------------------------------------------------------\n# No Colab: execute e envie o arquivo 'Cópia de Veículos.xlsx'\n# Fora do Colab: ajuste CAMINHO_LOCAL e pule o upload.\n\nCAMINHO_LOCAL = \"Cópia de Veículos.xlsx\"   # ajuste se necessário\n\ntry:\n    from google.colab import files\n    enviados = files.upload()\n    CAMINHO_LOCAL = list(enviados.keys())[0]\nexcept Exception:\n    pass\n\nif CAMINHO_LOCAL.lower().endswith((\".xlsx\", \".xls\")):\n    df_raw = pd.read_excel(CAMINHO_LOCAL)\nelse:\n    df_raw = pd.read_csv(CAMINHO_LOCAL, sep=None, engine=\"python\", encoding=\"utf-8\")\n\nprint(f\"Arquivo: {CAMINHO_LOCAL}\")\nprint(f\"Dimensões brutas: {df_raw.shape[0]:,} linhas x {df_raw.shape[1]} colunas\")\ndf_raw.head()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Entendimento dos dados\n\nAntes de limpar qualquer coisa, é preciso saber **o que existe**: tipos, nulos e — o mais\nimportante para variáveis categóricas — **cardinalidade**. Uma coluna com 800 valores distintos\nem 1.000 linhas é praticamente um identificador e exige tratamento especial."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Padroniza nomes de colunas e localiza automaticamente as colunas de interesse\ndef _slug(s):\n    s = str(s).strip()\n    s = unicodedata.normalize(\"NFKD\", s).encode(\"ascii\", \"ignore\").decode()\n    s = re.sub(r\"[^0-9a-zA-Z]+\", \"_\", s).strip(\"_\").lower()\n    return s\n\ndf = df_raw.copy()\ndf.columns = [_slug(c) for c in df.columns]\n\nMAPA = {\n    \"valor_fipe\":  [\"valor_fipe\", \"vlr_fipe\", \"valor\", \"preco_fipe\", \"fipe\", \"valor_tabela_fipe\"],\n    \"montadora\":   [\"montadora\", \"marca\", \"fabricante\"],\n    \"modelo\":      [\"modelo\", \"descricao_modelo\", \"veiculo\", \"modelo_versao\"],\n    \"cor\":         [\"cor\", \"cor_veiculo\"],\n    \"grupo\":       [\"grupo\", \"categoria\", \"tipo\", \"segmento\"],\n    \"situacao\":    [\"situacao\", \"status\", \"condicao\"],\n    \"ano_modelo\":  [\"ano_modelo\", \"anomodelo\", \"ano_mod\", \"ano\"],\n}\n\nresolvido, faltando = {}, []\nfor alvo, candidatos in MAPA.items():\n    achou = next((c for c in candidatos if c in df.columns), None)\n    if achou:\n        resolvido[achou] = alvo\n    else:\n        faltando.append(alvo)\n\ndf = df.rename(columns=resolvido)\nprint(\"Colunas mapeadas :\", resolvido)\nprint(\"Não encontradas  :\", faltando if faltando else \"nenhuma\")\nprint(\"\\nTodas as colunas do arquivo:\")\nprint(list(df.columns))"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Panorama: tipo, nulos, cardinalidade e exemplos\npanorama = pd.DataFrame({\n    \"tipo\": df.dtypes.astype(str),\n    \"nulos\": df.isna().sum(),\n    \"%_nulos\": (df.isna().mean() * 100).round(1),\n    \"n_unicos\": df.nunique(),\n    \"exemplo\": [df[c].dropna().iloc[0] if df[c].notna().any() else None for c in df.columns],\n})\npanorama[\"cardinalidade_%\"] = (panorama[\"n_unicos\"] / len(df) * 100).round(1)\ndisplay(panorama.sort_values(\"cardinalidade_%\", ascending=False))\n\nprint(\"\\nLeitura: cardinalidade acima de ~50% indica coluna quase-identificadora \"\n      \"(ex.: placa, chassi, renavam) — deve ser DESCARTADA como preditora.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 3. Limpeza e preparação\n\nOperações aplicadas, com justificativa:\n\n| Operação | Por quê |\n|---|---|\n| Conversão de `Valor FIPE` texto → numérico | Planilhas brasileiras trazem `R$ 12.345,67` como string |\n| Normalização de texto (maiúsculas, acentos, espaços) | `\"FIAT\"`, `\"Fiat \"` e `\"FIAT\"` viram a mesma categoria |\n| Remoção de alvo nulo / ≤ 0 | Sem alvo válido não há aprendizado supervisionado |\n| Filtro de `Ano Modelo` plausível | Corrige erros de digitação (ex.: `32000`, `19`) |\n| Remoção de outliers extremos do alvo | Valores absurdos distorcem MAE/RMSE e o ajuste linear |\n| Agrupamento de categorias raras em `OUTROS` | Evita colunas one-hot presentes só no treino |\n| **Remoção de linhas 100% duplicadas** | Registros repetidos inflam artificialmente o desempenho |"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "ANO_ATUAL = dt.date.today().year\n\ndef para_numero(serie):\n    '''Converte 'R$ 12.345,67' / '12.345,67' / 12345.67 em float.'''\n    if pd.api.types.is_numeric_dtype(serie):\n        return pd.to_numeric(serie, errors=\"coerce\")\n    s = (serie.astype(str)\n              .str.replace(r\"[Rr]\\$\", \"\", regex=True)\n              .str.replace(r\"\\s|\\u00a0\", \"\", regex=True)\n              .str.replace(\".\", \"\", regex=False)\n              .str.replace(\",\", \".\", regex=False))\n    return pd.to_numeric(s, errors=\"coerce\")\n\ndef normalizar_texto(serie):\n    s = serie.astype(str).str.strip().str.upper()\n    s = s.apply(lambda x: unicodedata.normalize(\"NFKD\", x).encode(\"ascii\", \"ignore\").decode())\n    s = s.str.replace(r\"\\s+\", \" \", regex=True)\n    return s.replace({\"NAN\": np.nan, \"\": np.nan, \"NONE\": np.nan, \"-\": np.nan})\n\nALVO = \"valor_fipe\"\nCATEGORICAS = [c for c in [\"montadora\", \"modelo\", \"cor\", \"grupo\", \"situacao\"] if c in df.columns]\nNUMERICAS   = [c for c in [\"ano_modelo\"] if c in df.columns]\n\nd = df.copy()\nregistro_limpeza = [(\"bruto\", len(d))]\n\nd[ALVO] = para_numero(d[ALVO])\nfor c in CATEGORICAS:\n    d[c] = normalizar_texto(d[c])\nif \"ano_modelo\" in d.columns:\n    d[\"ano_modelo\"] = pd.to_numeric(d[\"ano_modelo\"], errors=\"coerce\")\n\nd = d.dropna(subset=[ALVO]); registro_limpeza.append((\"alvo não nulo\", len(d)))\nd = d[d[ALVO] > 0];          registro_limpeza.append((\"alvo > 0\", len(d)))\n\nif \"ano_modelo\" in d.columns:\n    d = d[d[\"ano_modelo\"].between(1985, ANO_ATUAL + 1)]\n    registro_limpeza.append((f\"ano entre 1985 e {ANO_ATUAL+1}\", len(d)))\n\n# Outliers do alvo: limite generoso (3*IQR) — remove erro de cadastro, preserva veículo caro real\nq1, q3 = d[ALVO].quantile([.25, .75])\niqr = q3 - q1\nlim_inf, lim_sup = max(q1 - 3 * iqr, 0), q3 + 3 * iqr\nn_out = ((d[ALVO] < lim_inf) | (d[ALVO] > lim_sup)).sum()\nd = d[d[ALVO].between(lim_inf, lim_sup)]\nregistro_limpeza.append((f\"sem outliers (3xIQR): R$ {lim_inf:,.0f} a R$ {lim_sup:,.0f}\", len(d)))\n\nn_dup = d.duplicated().sum()\nd = d.drop_duplicates(); registro_limpeza.append((\"sem linhas 100% duplicadas\", len(d)))\n\nfor c in CATEGORICAS:\n    freq = d[c].value_counts()\n    raras = freq[freq < 2].index\n    d[c] = d[c].where(~d[c].isin(raras), \"OUTROS\").fillna(\"NAO_INFORMADO\")\n\nprint(f\"Outliers removidos: {n_out} | Linhas duplicadas removidas: {n_dup}\\n\")\ndisplay(pd.DataFrame(registro_limpeza, columns=[\"etapa\", \"linhas_restantes\"]))\nprint(f\"\\nDataset final: {len(d):,} veículos\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 3.1 Diagnóstico de vazamento (o achado mais importante do MVP)\n\nAqui verificamos quantos veículos são **indistinguíveis** entre si pelos atributos disponíveis.\nSe muitos registros compartilham a mesma chave *(montadora, modelo, ano)*, uma divisão aleatória\ntreino/teste vaza a resposta."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "chaves = [c for c in [\"montadora\", \"modelo\", \"ano_modelo\"] if c in d.columns]\nd[\"_grupo_veiculo\"] = d[chaves].astype(str).agg(\" | \".join, axis=1)\n\nn_grupos = d[\"_grupo_veiculo\"].nunique()\ntam = d[\"_grupo_veiculo\"].value_counts()\npct_repetidos = (tam[tam > 1].sum() / len(d) * 100)\n\nprint(f\"Registros                          : {len(d):,}\")\nprint(f\"Veículos distintos (marca|modelo|ano): {n_grupos:,}\")\nprint(f\"Registros em grupos repetidos      : {pct_repetidos:.1f}%\")\nprint(f\"Tamanho médio do grupo             : {tam.mean():.2f} | maior grupo: {tam.max()}\")\n\n# O alvo é determinístico dentro do grupo?\ndisp = d.groupby(\"_grupo_veiculo\")[ALVO].agg([\"nunique\", \"std\", \"count\"])\ndet = (disp[\"nunique\"] == 1).mean() * 100\nprint(f\"\\nGrupos com Valor FIPE único (determinístico): {det:.1f}%\")\nprint(\"-> Quanto mais próximo de 100%, mais o 'modelo' é apenas uma tabela de consulta \"\n      \"e maior o risco de vazamento numa divisão aleatória.\")\n\nprint(\"\\nTop 10 veículos mais repetidos na frota:\")\ndisplay(tam.head(10).rename(\"qtd\").to_frame())"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 4. Análise exploratória (EDA)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, ax = plt.subplots(2, 2, figsize=(14, 9))\n\nsns.histplot(d[ALVO], bins=40, kde=True, ax=ax[0, 0], color=\"#2b6cb0\")\nax[0, 0].set_title(\"Distribuição do Valor FIPE (R$)\")\nax[0, 0].set_xlabel(\"Valor FIPE\")\n\nsns.histplot(np.log1p(d[ALVO]), bins=40, kde=True, ax=ax[0, 1], color=\"#2f855a\")\nax[0, 1].set_title(\"Distribuição de log(1 + Valor FIPE)\")\nax[0, 1].set_xlabel(\"log(1+Valor)\")\n\nif \"ano_modelo\" in d.columns:\n    sns.scatterplot(data=d, x=\"ano_modelo\", y=ALVO, alpha=.35, ax=ax[1, 0], color=\"#c05621\")\n    ax[1, 0].set_title(\"Valor FIPE x Ano Modelo\")\n\nif \"montadora\" in d.columns:\n    top = d[\"montadora\"].value_counts().head(10).index\n    sns.boxplot(data=d[d[\"montadora\"].isin(top)], y=\"montadora\", x=ALVO,\n                ax=ax[1, 1], order=top, palette=\"crest\")\n    ax[1, 1].set_title(\"Valor FIPE por montadora (top 10 em volume)\")\n\nplt.tight_layout(); plt.show()\n\nassimetria = d[ALVO].skew()\nprint(f\"Assimetria (skewness) do alvo: {assimetria:.2f}\")\nprint(\"-> Assimetria > 1 justifica modelar log(valor): erro proporcional ao preço, \"\n      \"resíduos mais homocedásticos e melhor ajuste dos modelos lineares.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Poder explicativo de cada categórica: variância do alvo explicada pelos grupos (eta²)\ndef eta_quadrado(dados, cat, alvo):\n    grupos = dados.groupby(cat)[alvo]\n    ss_entre = ((grupos.mean() - dados[alvo].mean()) ** 2 * grupos.count()).sum()\n    ss_total = ((dados[alvo] - dados[alvo].mean()) ** 2).sum()\n    return ss_entre / ss_total if ss_total else np.nan\n\nlinhas = [{\"variavel\": c, \"n_categorias\": d[c].nunique(),\n           \"eta2 (var. explicada)\": round(eta_quadrado(d, c, ALVO), 3)} for c in CATEGORICAS]\nif \"ano_modelo\" in d.columns:\n    linhas.append({\"variavel\": \"ano_modelo (corr. Pearson)\", \"n_categorias\": d[\"ano_modelo\"].nunique(),\n                   \"eta2 (var. explicada)\": round(d[\"ano_modelo\"].corr(d[ALVO]) ** 2, 3)})\n\ndisplay(pd.DataFrame(linhas).sort_values(\"eta2 (var. explicada)\", ascending=False))\nprint(\"Atenção: eta² alto em variável de altíssima cardinalidade (ex.: 'modelo') NÃO significa \"\n      \"poder preditivo — significa memorização. É por isso que validamos por grupo.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 5. Engenharia de atributos\n\nTrês derivações com racional de negócio:\n\n1. **`idade`** — depreciação é função da idade, não do ano absoluto. Torna o modelo utilizável\n   em anos futuros sem re-treino conceitual.\n2. **`familia`** — primeiro token do modelo (`\"PALIO FIRE 1.0\"` → `\"PALIO\"`). Reduz a cardinalidade\n   e permite generalizar para versões nunca vistas.\n3. **`motor`** — cilindrada extraída por regex (`1.0`, `1.6`, `2.0`), forte proxy de porte e preço."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "d[\"idade\"] = ANO_ATUAL - d[\"ano_modelo\"] if \"ano_modelo\" in d.columns else np.nan\n\nif \"modelo\" in d.columns:\n    d[\"familia\"] = d[\"modelo\"].astype(str).str.split().str[0]\n    motor = d[\"modelo\"].astype(str).str.extract(r\"(\\d\\.\\d)\", expand=False)\n    d[\"motor\"] = pd.to_numeric(motor, errors=\"coerce\")\n    d[\"motor\"] = d[\"motor\"].where(d[\"motor\"].between(0.8, 8.0))\n    d[\"tem_motor_informado\"] = d[\"motor\"].notna().astype(int)\n\n    freq_fam = d[\"familia\"].value_counts()\n    d[\"familia\"] = d[\"familia\"].where(~d[\"familia\"].isin(freq_fam[freq_fam < 3].index), \"OUTROS\")\n\nCAT_FINAL = [c for c in [\"montadora\", \"familia\", \"cor\", \"grupo\", \"situacao\"] if c in d.columns]\nNUM_FINAL = [c for c in [\"idade\", \"motor\", \"tem_motor_informado\"] if c in d.columns]\n\nprint(\"Categóricas:\", CAT_FINAL)\nprint(\"Numéricas  :\", NUM_FINAL)\nprint(f\"\\nCardinalidade após agrupamento:\")\nfor c in CAT_FINAL:\n    print(f\"  {c:<12} {d[c].nunique():>4} categorias\")\n\nprint(\"\\nNota de projeto: 'modelo' bruto foi DESCARTADO como preditor e substituído por \"\n      \"'familia' + 'motor'. Manter 'modelo' cria ~800 colunas one-hot em ~1.000 linhas — \"\n      \"o modelo decora a tabela FIPE em vez de aprender a precificar.\")\nd[CAT_FINAL + NUM_FINAL + [ALVO]].head()"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 6. Modelagem e treinamento\n\n### Estratégia de validação\n- **Divisão treino/teste 80/20 por grupo** (`GroupShuffleSplit`) — nenhum veículo idêntico\n  aparece dos dois lados.\n- **`GroupKFold` com 5 folds** no treino para seleção de modelo (mais robusto que uma única\n  divisão em ~1.000 linhas, atendendo à sugestão de \"próximos passos\" do enunciado original).\n- **Alvo em log** (`TransformedTargetRegressor` manual via `log1p`/`expm1`) — o erro passa a ser\n  proporcional ao preço.\n\n### Modelos comparados\n| Modelo | Por que está aqui |\n|---|---|\n| `DummyRegressor` (média) | **Linha de base**: qualquer modelo precisa superá-la |\n| `Ridge` + one-hot | Linear regularizado; referência interpretável e resistente a colinearidade |\n| `RandomForest` | Captura interações e não-linearidades; robusto a outliers |\n| `HistGradientBoosting` / `XGBoost` | Estado da arte em dados tabulares |"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "X = d[CAT_FINAL + NUM_FINAL].copy()\ny = d[ALVO].copy()\ngrupos = d[\"_grupo_veiculo\"].copy()\n\ngss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=RANDOM_STATE)\nidx_tr, idx_te = next(gss.split(X, y, groups=grupos))\nX_tr, X_te = X.iloc[idx_tr], X.iloc[idx_te]\ny_tr, y_te = y.iloc[idx_tr], y.iloc[idx_te]\ng_tr = grupos.iloc[idx_tr]\n\nprint(f\"Treino: {len(X_tr):,} registros | {g_tr.nunique():,} veículos distintos\")\nprint(f\"Teste : {len(X_te):,} registros | {grupos.iloc[idx_te].nunique():,} veículos distintos\")\nprint(f\"Interseção de veículos entre treino e teste: \"\n      f\"{len(set(g_tr) & set(grupos.iloc[idx_te]))} (deve ser 0)\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "try:\n    ohe = OneHotEncoder(handle_unknown=\"infrequent_if_exist\", min_frequency=2, sparse_output=False)\nexcept TypeError:\n    ohe = OneHotEncoder(handle_unknown=\"ignore\", sparse=False)\n\npreproc = ColumnTransformer([\n    (\"cat\", Pipeline([(\"imp\", SimpleImputer(strategy=\"constant\", fill_value=\"NAO_INFORMADO\")),\n                      (\"ohe\", ohe)]), CAT_FINAL),\n    (\"num\", Pipeline([(\"imp\", SimpleImputer(strategy=\"median\")),\n                      (\"sc\",  StandardScaler())]), NUM_FINAL),\n])\n\nmodelos = {\n    \"Baseline (média)\": DummyRegressor(strategy=\"mean\"),\n    \"Ridge\": Ridge(alpha=1.0, random_state=None),\n    \"Random Forest\": RandomForestRegressor(\n        n_estimators=400, min_samples_leaf=2, n_jobs=-1, random_state=RANDOM_STATE),\n    \"HistGradientBoosting\": HistGradientBoostingRegressor(\n        max_iter=400, learning_rate=0.06, max_leaf_nodes=31, random_state=RANDOM_STATE),\n}\nif HAS_XGB:\n    modelos[\"XGBoost\"] = XGBRegressor(\n        n_estimators=600, learning_rate=0.05, max_depth=5, subsample=0.8,\n        colsample_bytree=0.8, reg_lambda=1.0, random_state=RANDOM_STATE, n_jobs=-1)\n\ndef montar(modelo):\n    return Pipeline([(\"prep\", preproc), (\"modelo\", modelo)])\n\ndef metricas(y_real, y_pred):\n    return {\n        \"MAE (R$)\":  mean_absolute_error(y_real, y_pred),\n        \"RMSE (R$)\": np.sqrt(mean_squared_error(y_real, y_pred)),\n        \"R²\":        r2_score(y_real, y_pred),\n        \"MAPE (%)\":  np.mean(np.abs((y_real - y_pred) / np.maximum(y_real, 1))) * 100,\n    }\n\nprint(f\"{len(modelos)} modelos configurados.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Validação cruzada honesta: GroupKFold, alvo em log, predições fora-da-amostra\ncv = GroupKFold(n_splits=5)\nresultados, oof_por_modelo = [], {}\n\nfor nome, modelo in modelos.items():\n    pipe = montar(modelo)\n    oof_log = cross_val_predict(pipe, X_tr, np.log1p(y_tr), cv=cv, groups=g_tr, n_jobs=1)\n    oof = np.expm1(oof_log)\n    oof_por_modelo[nome] = oof\n    resultados.append({\"Modelo\": nome, **metricas(y_tr.values, oof)})\n\ntabela_cv = pd.DataFrame(resultados).sort_values(\"MAE (R$)\").reset_index(drop=True)\nprint(\"VALIDAÇÃO CRUZADA — GroupKFold 5 folds (sem vazamento)\\n\")\ndisplay(tabela_cv.style.background_gradient(subset=[\"MAE (R$)\", \"RMSE (R$)\"], cmap=\"RdYlGn_r\"))\n\nMELHOR = tabela_cv.iloc[0][\"Modelo\"]\nif MELHOR == \"Baseline (média)\":\n    MELHOR = tabela_cv.iloc[1][\"Modelo\"]\nprint(f\"\\nMelhor modelo: {MELHOR}\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "### 6.1 Prova do vazamento: divisão aleatória vs. divisão por grupo\n\nRodamos **o mesmo modelo** nas duas estratégias. A diferença entre os R² é a medida direta\nde quanto o resultado original estava inflado."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "pipe_demo = montar(modelos[MELHOR])\n\n# (a) K-Fold aleatório — a forma ingênua\noof_ing = np.expm1(cross_val_predict(pipe_demo, X, np.log1p(y),\n                                     cv=KFold(5, shuffle=True, random_state=RANDOM_STATE), n_jobs=1))\n# (b) GroupKFold — a forma correta\noof_ok = np.expm1(cross_val_predict(pipe_demo, X, np.log1p(y),\n                                    cv=GroupKFold(5), groups=grupos, n_jobs=1))\n\ncomparacao = pd.DataFrame([\n    {\"Estratégia\": \"KFold aleatório (COM vazamento)\",  **metricas(y.values, oof_ing)},\n    {\"Estratégia\": \"GroupKFold por veículo (correto)\", **metricas(y.values, oof_ok)},\n])\ndisplay(comparacao)\n\ndelta = comparacao.loc[0, \"R²\"] - comparacao.loc[1, \"R²\"]\nsubest = comparacao.loc[1, \"MAE (R$)\"] - comparacao.loc[0, \"MAE (R$)\"]\nprint(f\"\\nInflação do R² causada pelo vazamento: {delta:+.4f}\")\nprint(f\"MAE subestimado em: R$ {subest:,.2f}\")\n\nif delta > 0.05:\n    print(\"\\nCONCLUSÃO: há vazamento relevante. As métricas obtidas com divisão aleatória \"\n          \"neste dataset são OTIMISTAS e não devem ser reportadas.\\n\"\n          \"O número válido para a decisão é o da linha 'GroupKFold'.\")\nelse:\n    print(\"\\nCONCLUSÃO: o vazamento medido foi pequeno neste corte — os veículos repetidos \"\n          \"não carregam valores idênticos o bastante para o modelo decorar.\\n\"\n          \"Ainda assim, reporte a linha 'GroupKFold': é a estimativa conservadora e defensável.\")"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 7. Avaliação em dados não vistos\n\nTreinamos o modelo vencedor em todo o conjunto de treino e avaliamos no conjunto de teste\n(20% separado no início, sem nenhum veículo em comum)."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "modelo_final = montar(modelos[MELHOR])\nmodelo_final.fit(X_tr, np.log1p(y_tr))\n\npred_tr = np.expm1(modelo_final.predict(X_tr))\npred_te = np.expm1(modelo_final.predict(X_te))\n\naval = pd.DataFrame([\n    {\"Conjunto\": \"Treino\", **metricas(y_tr.values, pred_tr)},\n    {\"Conjunto\": \"Teste (não visto)\", **metricas(y_te.values, pred_te)},\n])\ndisplay(aval)\n\ngap = aval.loc[0, \"R²\"] - aval.loc[1, \"R²\"]\nprint(f\"\\nDiagnóstico de ajuste — gap de R² (treino - teste): {gap:.4f}\")\nif gap > 0.15:\n    print(\"  -> OVERFITTING: reduza a complexidade (menos folhas/profundidade, mais regularização).\")\nelif aval.loc[1, \"R²\"] < 0.5:\n    print(\"  -> UNDERFITTING: o modelo não captura o sinal; faltam atributos relevantes.\")\nelse:\n    print(\"  -> Ajuste equilibrado: generaliza para veículos que nunca viu.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "fig, ax = plt.subplots(1, 3, figsize=(16, 4.6))\nres = y_te.values - pred_te\n\nax[0].scatter(y_te, pred_te, alpha=.5, color=\"#2b6cb0\", edgecolor=\"none\")\nlim = [0, max(y_te.max(), pred_te.max())]\nax[0].plot(lim, lim, \"r--\", lw=1.5, label=\"predição perfeita\")\nax[0].set(xlabel=\"Valor FIPE real (R$)\", ylabel=\"Valor previsto (R$)\",\n          title=f\"Real vs. Previsto — {MELHOR}\")\nax[0].legend()\n\nax[1].scatter(pred_te, res, alpha=.5, color=\"#c05621\", edgecolor=\"none\")\nax[1].axhline(0, color=\"r\", ls=\"--\", lw=1.5)\nax[1].set(xlabel=\"Valor previsto (R$)\", ylabel=\"Resíduo (R$)\", title=\"Resíduos\")\n\nsns.histplot(res, bins=30, kde=True, ax=ax[2], color=\"#2f855a\")\nax[2].axvline(0, color=\"r\", ls=\"--\")\nax[2].set(xlabel=\"Erro (R$)\", title=\"Distribuição dos erros\")\n\nplt.tight_layout(); plt.show()\n\nerro_rel = np.abs(res) / y_te.values * 100\nprint(f\"Erro absoluto mediano : R$ {np.median(np.abs(res)):,.2f}\")\nprint(f\"Erro relativo mediano : {np.median(erro_rel):.1f}%\")\nfor faixa in (5, 10, 20):\n    print(f\"Previsões com erro < {faixa}% : {(erro_rel < faixa).mean()*100:.1f}%\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Importância por permutação: mede a perda de desempenho ao embaralhar cada atributo\nimp = permutation_importance(modelo_final, X_te, np.log1p(y_te),\n                             n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1,\n                             scoring=\"neg_mean_absolute_error\")\ntabela_imp = (pd.DataFrame({\"atributo\": X_te.columns,\n                            \"importancia\": imp.importances_mean,\n                            \"desvio\": imp.importances_std})\n              .sort_values(\"importancia\", ascending=False))\n\nplt.figure(figsize=(9, 4.5))\nordem = tabela_imp.iloc[::-1]\nplt.barh(ordem[\"atributo\"], ordem[\"importancia\"], xerr=ordem[\"desvio\"],\n         color=\"#2b6cb0\", alpha=.85, capsize=3)\nplt.title(\"Importância por permutação (impacto no MAE)\")\nplt.xlabel(\"Queda de desempenho ao embaralhar o atributo\")\nplt.tight_layout(); plt.show()\ndisplay(tabela_imp)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Análise de erros: onde o modelo mais erra?\nanalise = X_te.copy()\nanalise[\"valor_real\"]  = y_te.values\nanalise[\"valor_prev\"]  = pred_te\nanalise[\"erro_abs\"]    = np.abs(res)\nanalise[\"erro_pct\"]    = erro_rel\n\nprint(\"Os 10 maiores erros (candidatos a revisão de cadastro ou atributo faltante):\")\ndisplay(analise.nlargest(10, \"erro_abs\")[\n    [c for c in [\"montadora\", \"familia\", \"idade\", \"grupo\", \"situacao\"] if c in analise.columns]\n    + [\"valor_real\", \"valor_prev\", \"erro_abs\", \"erro_pct\"]])\n\nif \"montadora\" in analise.columns:\n    por_marca = (analise.groupby(\"montadora\")\n                 .agg(n=(\"erro_abs\", \"size\"), mae=(\"erro_abs\", \"mean\"), mape=(\"erro_pct\", \"mean\"))\n                 .query(\"n >= 5\").sort_values(\"mae\", ascending=False))\n    print(\"\\nErro por montadora (mín. 5 veículos no teste):\")\n    display(por_marca)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 8. Camada de suporte à decisão\n\nUm modelo de regressão sozinho não é um SSD. O que transforma a previsão em **decisão** é:\n\n1. **Intervalo de confiança empírico** — calibrado pelos quantis dos resíduos fora-da-amostra\n   (em escala log, o que gera um intervalo multiplicativo coerente com preços).\n2. **Regra de decisão sobre a oferta** — compara o preço pedido com a faixa prevista e emite\n   uma recomendação acionável.\n3. **Sinalizador de baixa confiança** — quando o veículo cai em categoria rara, o sistema avisa\n   em vez de fingir certeza."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Calibra o intervalo com os resíduos fora-da-amostra do melhor modelo (escala log)\noof_melhor = oof_por_modelo[MELHOR]\nres_log = np.log1p(y_tr.values) - np.log1p(np.maximum(oof_melhor, 0))\nq05, q95 = np.quantile(res_log, [0.05, 0.95])\nCOBERTURA = 90\n\nMARCAS_COMUNS  = set(d[\"montadora\"].value_counts()[lambda s: s >= 5].index) if \"montadora\" in d else set()\nFAMILIAS_COMUNS = set(d[\"familia\"].value_counts()[lambda s: s >= 5].index) if \"familia\" in d else set()\n\ndef avaliar_veiculo(montadora=None, familia=None, ano_modelo=None, cor=None,\n                    grupo=None, situacao=None, preco_ofertado=None, verbose=True):\n    '''Estima o Valor FIPE, o intervalo de confiança e recomenda uma ação sobre a oferta.'''\n    reg = {}\n    if \"montadora\" in CAT_FINAL: reg[\"montadora\"] = (montadora or \"NAO_INFORMADO\").upper()\n    if \"familia\"   in CAT_FINAL: reg[\"familia\"]   = (familia   or \"NAO_INFORMADO\").upper()\n    if \"cor\"       in CAT_FINAL: reg[\"cor\"]       = (cor       or \"NAO_INFORMADO\").upper()\n    if \"grupo\"     in CAT_FINAL: reg[\"grupo\"]     = (grupo     or \"NAO_INFORMADO\").upper()\n    if \"situacao\"  in CAT_FINAL: reg[\"situacao\"]  = (situacao  or \"NAO_INFORMADO\").upper()\n    if \"idade\" in NUM_FINAL:\n        reg[\"idade\"] = ANO_ATUAL - ano_modelo if ano_modelo else np.nan\n    if \"motor\" in NUM_FINAL:\n        reg[\"motor\"] = np.nan\n        reg[\"tem_motor_informado\"] = 0\n\n    entrada = pd.DataFrame([reg])[CAT_FINAL + NUM_FINAL]\n    log_pred = modelo_final.predict(entrada)[0]\n\n    estimado = float(np.expm1(log_pred))\n    piso     = float(np.expm1(log_pred + q05))\n    teto     = float(np.expm1(log_pred + q95))\n\n    alertas = []\n    if \"montadora\" in reg and reg[\"montadora\"] not in MARCAS_COMUNS:\n        alertas.append(\"montadora pouco representada na base\")\n    if \"familia\" in reg and reg[\"familia\"] not in FAMILIAS_COMUNS:\n        alertas.append(\"família de modelo pouco representada na base\")\n    if ano_modelo and not (1985 <= ano_modelo <= ANO_ATUAL + 1):\n        alertas.append(\"ano-modelo fora da faixa de treino\")\n\n    decisao, justificativa = None, None\n    if preco_ofertado is not None:\n        desvio = (preco_ofertado - estimado) / estimado * 100\n        if preco_ofertado < piso:\n            decisao = \"COMPRAR — oferta abaixo da faixa esperada\"\n        elif preco_ofertado > teto:\n            decisao = \"RECUSAR / RENEGOCIAR — oferta acima da faixa esperada\"\n        else:\n            decisao = \"NEGOCIAR — oferta dentro da faixa esperada\"\n        justificativa = f\"desvio de {desvio:+.1f}% em relação ao valor estimado\"\n\n    if verbose:\n        print(\"=\" * 62)\n        print(\"  AVALIAÇÃO DE VEÍCULO — Suporte à Decisão\")\n        print(\"=\" * 62)\n        print(f\"  {montadora or '?'} {familia or ''} | ano-modelo {ano_modelo or '?'}\")\n        print(\"-\" * 62)\n        print(f\"  Valor estimado          : R$ {estimado:>14,.2f}\")\n        print(f\"  Faixa esperada ({COBERTURA}%)   : R$ {piso:>14,.2f}  a  R$ {teto:>12,.2f}\")\n        if preco_ofertado is not None:\n            print(f\"  Preço ofertado          : R$ {preco_ofertado:>14,.2f}\")\n            print(\"-\" * 62)\n            print(f\"  >> {decisao}\")\n            print(f\"     ({justificativa})\")\n        if alertas:\n            print(\"-\" * 62)\n            for a in alertas:\n                print(f\"  [!] Baixa confiança: {a}\")\n        print(\"=\" * 62)\n\n    return {\"estimado\": estimado, \"piso\": piso, \"teto\": teto,\n            \"decisao\": decisao, \"justificativa\": justificativa, \"alertas\": alertas}\n\n# Validação da calibração: quantos veículos do teste caem dentro da faixa prevista?\nlog_te = modelo_final.predict(X_te)\ndentro = ((y_te.values >= np.expm1(log_te + q05)) & (y_te.values <= np.expm1(log_te + q95))).mean()\nprint(f\"Cobertura nominal do intervalo : {COBERTURA}%\")\nprint(f\"Cobertura observada no teste   : {dentro*100:.1f}%\")\nprint(\"-> Próximo do nominal = intervalo bem calibrado e confiável para decisão.\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Demonstração de uso com um veículo real da base\nexemplo = d.sample(1, random_state=7).iloc[0]\nprint(f\"[Veículo sorteado da base] Valor FIPE real: R$ {exemplo[ALVO]:,.2f}\\n\")\n\nsaida = avaliar_veiculo(\n    montadora=exemplo.get(\"montadora\"),\n    familia=exemplo.get(\"familia\"),\n    ano_modelo=int(exemplo[\"ano_modelo\"]) if pd.notna(exemplo.get(\"ano_modelo\")) else None,\n    cor=exemplo.get(\"cor\"),\n    grupo=exemplo.get(\"grupo\"),\n    situacao=exemplo.get(\"situacao\"),\n    preco_ofertado=float(exemplo[ALVO]) * 0.85,   # simula oferta 15% abaixo da FIPE\n)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Aplicação em lote: varre a frota e ranqueia veículos mal precificados no cadastro\nlog_todos = modelo_final.predict(X)\npainel = d[[c for c in [\"montadora\", \"familia\", \"ano_modelo\", \"grupo\", \"situacao\"] if c in d.columns]].copy()\npainel[\"valor_cadastrado\"] = y.values\npainel[\"valor_estimado\"]   = np.expm1(log_todos)\npainel[\"piso\"]             = np.expm1(log_todos + q05)\npainel[\"teto\"]             = np.expm1(log_todos + q95)\npainel[\"desvio_%\"]         = (painel[\"valor_cadastrado\"] / painel[\"valor_estimado\"] - 1) * 100\n\npainel[\"situacao_preco\"] = np.select(\n    [painel[\"valor_cadastrado\"] < painel[\"piso\"], painel[\"valor_cadastrado\"] > painel[\"teto\"]],\n    [\"SUBAVALIADO\", \"SUPERAVALIADO\"], default=\"DENTRO DA FAIXA\")\n\nprint(\"Distribuição do parecer sobre o cadastro da frota:\")\ndisplay(painel[\"situacao_preco\"].value_counts().to_frame(\"qtd\")\n        .assign(**{\"%\": lambda t: (t[\"qtd\"] / len(painel) * 100).round(1)}))\n\nprint(\"\\nTop 10 veículos a revisar (maior desvio absoluto):\")\ndisplay(painel.reindex(painel[\"desvio_%\"].abs().sort_values(ascending=False).index).head(10))"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 9. Persistência do modelo"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import joblib, json as _json\n\nartefato = {\n    \"pipeline\": modelo_final,\n    \"modelo\": MELHOR,\n    \"atributos_categoricos\": CAT_FINAL,\n    \"atributos_numericos\": NUM_FINAL,\n    \"quantis_residuo_log\": (float(q05), float(q95)),\n    \"cobertura_intervalo\": COBERTURA,\n    \"ano_referencia\": ANO_ATUAL,\n    \"metricas_teste\": {k: float(v) for k, v in metricas(y_te.values, pred_te).items()},\n}\njoblib.dump(artefato, \"modelo_fipe_mvp.joblib\")\n\nwith open(\"metricas_mvp.json\", \"w\", encoding=\"utf-8\") as f:\n    _json.dump({\"melhor_modelo\": MELHOR,\n                \"cv_groupkfold\": tabela_cv.to_dict(orient=\"records\"),\n                \"teste\": artefato[\"metricas_teste\"],\n                \"n_registros\": int(len(d)),\n                \"n_veiculos_distintos\": int(n_grupos)}, f, ensure_ascii=False, indent=2)\n\nprint(\"Salvos: modelo_fipe_mvp.joblib e metricas_mvp.json\")\ntry:\n    from google.colab import files\n    files.download(\"modelo_fipe_mvp.joblib\")\n    files.download(\"metricas_mvp.json\")\nexcept Exception:\n    pass"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 10. Conclusões, limitações e próximos passos\n\n### Conclusões\n\n1. **O resultado original estava inflado por vazamento.** A frota contém veículos idênticos\n   (mesma marca/modelo/ano) e, portanto, mesmo Valor FIPE. Com divisão aleatória, cópias do\n   mesmo veículo caem em treino e teste — o modelo consulta a resposta em vez de generalizar.\n   A célula 6.1 quantifica essa diferença.\n\n2. **Regressão linear superando XGBoost é o sintoma, não o resultado.** Com `modelo` one-hot em\n   alta cardinalidade, a regressão linear consegue estimar praticamente uma média por modelo —\n   o que, sob vazamento, parece excelente. Corrigida a validação, a ordem esperada\n   (boosting ≥ floresta ≥ linear) tende a se restabelecer.\n\n3. **Substituir `modelo` por `familia` + `motor`** troca memorização por capacidade de\n   generalização: o sistema passa a precificar versões que nunca viu.\n\n4. **O alvo em escala log** é a escolha correta: preços de veículos são fortemente assimétricos,\n   e o erro que interessa ao gestor é o relativo (%), não o absoluto.\n\n5. **Cor, grupo e situação não entram no cálculo oficial da FIPE.** Se aparecerem com alta\n   importância, estão atuando como proxy de segmento — o que é aceitável, desde que documentado.\n\n### Limitações\n- Amostra pequena (~1.000 registros) e concentrada em poucas montadoras — o modelo não\n  extrapola bem para marcas ausentes da base.\n- Sem dimensão temporal: a FIPE é atualizada mensalmente e o dataset é um retrato estático.\n- Sem quilometragem, estado de conservação ou opcionais — os principais determinantes do preço\n  real de negociação (a FIPE é apenas a referência).\n\n### Próximos passos priorizados\n| # | Ação | Ganho esperado |\n|---|---|---|\n| 1 | Enriquecer com a API pública da FIPE (versão exata, combustível, código FIPE) | Alto |\n| 2 | `RandomizedSearchCV` com `GroupKFold` para tunar o boosting | Médio |\n| 3 | Target encoding de `familia` com validação aninhada | Médio |\n| 4 | Série histórica mensal → prever *depreciação futura*, não só valor atual | Alto (novo caso de uso) |\n| 5 | Empacotar `avaliar_veiculo()` em uma API/Streamlit para o usuário final | Alto (viabiliza o SSD) |\n| 6 | Monitorar *drift*: reavaliar MAE a cada atualização mensal da FIPE | Alto (operação) |\n\n---\n*MVP desenvolvido para a disciplina de Sistemas de Suporte à Decisão.*"
+   ]
+  }
+ ],
+ "metadata": {
+  "colab": {
+   "provenance": [],
+   "toc_visible": true
+  },
+  "kernelspec": {
+   "display_name": "Python 3",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 0
+}
